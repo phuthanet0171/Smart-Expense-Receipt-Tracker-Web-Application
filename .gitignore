@@ -12,6 +12,9 @@
 
 # testing
 /coverage
+/.test-build/
+/.npm-cache/
+/*.traineddata
 
 # next.js
 /.next/

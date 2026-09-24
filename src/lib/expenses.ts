@@ -1,5 +1,6 @@
 import { categoryLabel, Category, categories } from './categories';
 import { isDemoMode, supabase } from './supabase';
+import type { ImageQuality, ReceiptDetailsGuess } from './ocr';
 
 export { categories } from './categories';
 export type Expense = {
@@ -13,6 +14,17 @@ export type Expense = {
   created_at?: string;
 };
 export type Draft = Omit<Expense, 'id' | 'created_at'>;
+export type ReceiptAnalysisDraft = {
+  merchantName: string;
+  transactionDate: string | null;
+  total: number | null;
+  details: ReceiptDetailsGuess;
+  ocrText: string;
+  fieldConfidence: Record<string, number>;
+  imageQuality: ImageQuality;
+  cropMetadata?: Record<string, number | string | boolean>;
+};
+export type StoredReceiptAnalysis = ReceiptAnalysisDraft & { id: string };
 export type ExpenseFilters = { month?: string; category?: Category | 'all'; search?: string };
 const demoKey = 'pocket-demo-expenses-v2';
 
@@ -79,6 +91,25 @@ export async function getExpense(id: string): Promise<Expense> {
   return { ...data, amount: Number(data.amount), category: data.category as Category };
 }
 
+export async function getReceiptAnalysis(expenseId: string): Promise<StoredReceiptAnalysis | null> {
+  if (isDemoMode()) return null;
+  const { data, error } = await supabase!.from('receipts').select('id,merchant_name,transaction_date,total,receipt_number,tax_id,branch,transaction_time,subtotal,discount,tax,payment_method,ocr_text,field_confidence,image_quality,crop_metadata,receipt_items(line_number,name,quantity,unit_price,total,confidence)').eq('expense_id', expenseId).maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  const items = [...(data.receipt_items || [])].sort((a, b) => a.line_number - b.line_number).map(item => ({ name: item.name, quantity: Number(item.quantity), unitPrice: item.unit_price === null ? null : Number(item.unit_price), total: Number(item.total), confidence: Number(item.confidence) }));
+  return {
+    id: data.id,
+    merchantName: data.merchant_name,
+    transactionDate: data.transaction_date,
+    total: data.total === null ? null : Number(data.total),
+    details: { receiptNumber: data.receipt_number, taxId: data.tax_id, branch: data.branch, transactionTime: data.transaction_time?.slice(0, 5) || '', subtotal: data.subtotal === null ? null : Number(data.subtotal), discount: data.discount === null ? null : Number(data.discount), tax: data.tax === null ? null : Number(data.tax), paymentMethod: data.payment_method, items },
+    ocrText: data.ocr_text,
+    fieldConfidence: data.field_confidence as Record<string, number>,
+    imageQuality: data.image_quality as ImageQuality,
+    cropMetadata: data.crop_metadata as Record<string, number | string | boolean>,
+  };
+}
+
 export function validateFile(file: File) {
   if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 5 * 1024 * 1024) throw new Error('รองรับ JPG, PNG และ WebP ขนาดไม่เกิน 5 MB');
 }
@@ -99,7 +130,40 @@ async function uploadReceipt(file: File, id: string) {
   return path;
 }
 
-export async function saveExpense(draft: Draft, file?: File | null, id?: string) {
+async function saveReceiptAnalysis(expenseId: string, storagePath: string | null, analysis: ReceiptAnalysisDraft) {
+  const { error } = await supabase!.rpc('save_receipt_analysis', {
+    p_expense_id: expenseId,
+    p_storage_path: storagePath,
+    p_receipt: {
+      merchant_name: analysis.merchantName,
+      receipt_number: analysis.details.receiptNumber,
+      tax_id: analysis.details.taxId,
+      branch: analysis.details.branch,
+      transaction_date: analysis.transactionDate,
+      transaction_time: analysis.details.transactionTime || null,
+      subtotal: analysis.details.subtotal,
+      discount: analysis.details.discount,
+      tax: analysis.details.tax,
+      total: analysis.total,
+      payment_method: analysis.details.paymentMethod,
+      ocr_text: analysis.ocrText,
+      field_confidence: analysis.fieldConfidence,
+      image_quality: analysis.imageQuality,
+      crop_metadata: analysis.cropMetadata || {},
+    },
+    p_items: analysis.details.items.map((item, lineNumber) => ({
+      line_number: lineNumber,
+      name: item.name,
+      quantity: item.quantity,
+      unit_price: item.unitPrice,
+      total: item.total,
+      confidence: item.confidence,
+    })),
+  });
+  if (error) throw error;
+}
+
+export async function saveExpense(draft: Draft, file?: File | null, id?: string, analysis?: ReceiptAnalysisDraft | null) {
   validate(draft);
   if (isDemoMode()) {
     if (file) throw new Error('เชื่อมต่อ Supabase ก่อนบันทึกรูปใบเสร็จ');
@@ -120,6 +184,16 @@ export async function saveExpense(draft: Draft, file?: File | null, id?: string)
   if (error) {
     if (file && receiptPath && receiptPath !== old?.receipt_path) await supabase!.storage.from('receipts').remove([receiptPath]);
     throw error;
+  }
+  if (analysis) {
+    try { await saveReceiptAnalysis(expenseId, receiptPath, analysis); }
+    catch (analysisError) {
+      if (!id) {
+        await supabase!.from('expenses').delete().eq('id', expenseId);
+        if (receiptPath) await supabase!.storage.from('receipts').remove([receiptPath]);
+      }
+      throw analysisError;
+    }
   }
   if (file && old?.receipt_path && old.receipt_path !== receiptPath) await supabase!.storage.from('receipts').remove([old.receipt_path]);
   return expenseId;
